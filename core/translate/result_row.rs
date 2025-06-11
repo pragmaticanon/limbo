@@ -85,20 +85,45 @@ pub fn emit_result_row_and_limit(
             cursor_id: index_cursor_id,
             index: dedupe_index,
         } => {
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: result_columns_start_reg,
-                count: plan.result_columns.len(),
-                dest_reg: record_reg,
-                index_name: Some(dedupe_index.name.clone()),
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *index_cursor_id,
-                record_reg,
-                unpacked_start: None,
-                unpacked_count: None,
-                flags: IdxInsertFlags::new(),
-            });
+            if dedupe_index.unique {
+                let label_skip = program.allocate_label();
+                program.emit_insn(Insn::Found {
+                    cursor_id: *index_cursor_id,
+                    target_pc: label_skip,
+                    record_reg: result_columns_start_reg,
+                    num_regs: dedupe_index.columns.len(),
+                });
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: result_columns_start_reg,
+                    count: plan.result_columns.len(),
+                    dest_reg: record_reg,
+                    index_name: Some(dedupe_index.name.clone()),
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *index_cursor_id,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+                program.preassign_label_to_next_insn(label_skip);
+            } else {
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: result_columns_start_reg,
+                    count: plan.result_columns.len(),
+                    dest_reg: record_reg,
+                    index_name: Some(dedupe_index.name.clone()),
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *index_cursor_id,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+            }
         }
         QueryDestination::CoroutineYield { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {

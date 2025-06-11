@@ -83,7 +83,60 @@ pub fn translate_insert(
         crate::bail_corrupt_error!("Parse error: no such table: {}", table_name);
     };
     if !btree_table.has_rowid {
-        crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
+        // Limited support for WITHOUT ROWID tables: only single row VALUES or DEFAULT VALUES
+        let mut values: Vec<Expr> = Vec::new();
+        match &mut body {
+            InsertBody::Select(select, _) => match select.body.select.as_mut() {
+                OneSelect::Values(vals) if vals.len() <= 1 => {
+                    if let Some(mut row) = vals.pop() {
+                        let mut param_idx = 1;
+                        for expr in row.iter_mut() {
+                            rewrite_expr(expr, &mut param_idx)?;
+                        }
+                        values = row;
+                    }
+                }
+                _ => {
+                    crate::bail_parse_error!("unsupported INSERT for WITHOUT ROWID table")
+                }
+            },
+            InsertBody::DefaultValues => (),
+        }
+
+        let column_mappings = resolve_columns_for_insert(&table, &columns, values.len())?;
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(btree_table.root_page),
+            name: table_name.0.clone(),
+        });
+        let column_registers_start = program.alloc_registers(column_mappings.len());
+        let record_register = program.alloc_register();
+        populate_column_registers(
+            &mut program,
+            &values,
+            &column_mappings,
+            column_registers_start,
+            0,
+            &resolver,
+        )?;
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: column_registers_start,
+            count: column_mappings.len(),
+            dest_reg: record_register,
+            index_name: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id,
+            record_reg: record_register,
+            unpacked_start: Some(column_registers_start),
+            unpacked_count: Some(btree_table.primary_key_columns.len() as u16),
+            flags: IdxInsertFlags::new(),
+        });
+        let halt_label = program.allocate_label();
+        program.resolve_label(halt_label, program.offset());
+        program.epilogue(super::emitter::TransactionMode::Write);
+        return Ok(program);
     }
 
     let root_page = btree_table.root_page;

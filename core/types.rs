@@ -1144,7 +1144,7 @@ impl Default for IndexKeySortOrder {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 /// Metadata about an index, used for handling and comparing index keys.
 ///
 /// This struct provides information about the sorting order of columns,
@@ -1157,6 +1157,15 @@ pub struct IndexKeyInfo {
     pub has_rowid: bool,
     /// The total number of columns in the index, including the row ID column if present.
     pub num_cols: usize,
+    /// Positions of the indexed columns within the table record.
+    ///
+    /// Limbo stores table records in their original column order. For
+    /// `WITHOUT ROWID` tables the B-tree key is formed by the primary key
+    /// columns which may appear anywhere in that order.  When enforcing
+    /// uniqueness we therefore need to know which record fields make up the
+    /// key rather than assuming they are a prefix.  This vector records those
+    /// column indexes so `IdxInsert` can compare only the relevant fields.
+    pub key_columns: Vec<usize>,
 }
 
 impl IndexKeyInfo {
@@ -1165,6 +1174,7 @@ impl IndexKeyInfo {
             sort_order: IndexKeySortOrder::from_index(index),
             has_rowid: index.has_rowid,
             num_cols: index.columns.len() + (index.has_rowid as usize),
+            key_columns: index.columns.iter().map(|c| c.pos_in_table).collect(),
         }
     }
 }

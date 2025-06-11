@@ -548,6 +548,26 @@ impl BTreeCursor {
         Self::new(mv_cursor, pager, root_page, Vec::new())
     }
 
+    /// Create a cursor for a WITHOUT ROWID table. The table is backed by an
+    /// index btree using the primary key as the key.
+    pub fn new_table_without_rowid(
+        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        pager: Rc<Pager>,
+        root_page: usize,
+        sort_order: IndexKeySortOrder,
+        collations: Vec<CollationSeq>,
+        key_columns: Vec<usize>,
+    ) -> Self {
+        let mut cursor = Self::new(mv_cursor, pager, root_page, collations);
+        cursor.index_key_info = Some(IndexKeyInfo {
+            sort_order,
+            has_rowid: false,
+            num_cols: key_columns.len(),
+            key_columns,
+        });
+        cursor
+    }
+
     pub fn new_index(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
         pager: Rc<Pager>,
@@ -570,7 +590,9 @@ impl BTreeCursor {
     pub fn has_rowid(&self) -> bool {
         match &self.index_key_info {
             Some(index_key_info) => index_key_info.has_rowid,
-            None => true, // currently we don't support WITHOUT ROWID tables
+            // If there is no index information, assume a regular table with a
+            // rowid backing.
+            None => true,
         }
     }
 
@@ -4569,26 +4591,50 @@ impl BTreeCursor {
         let record_opt = return_if_io!(self.record());
         match record_opt.as_ref() {
             Some(record) => {
-                // Existing record found — compare prefix
-                let existing_key = &record.get_values()[..record.count().saturating_sub(1)];
-                let inserted_key_vals = &key.get_values();
-                // Need this check because .all returns True on an empty iterator,
-                // So when record_opt is invalidated, it would always indicate show up as a duplicate key
-                if existing_key.len() != inserted_key_vals.len() {
-                    return Ok(CursorResult::Ok(false));
-                }
+                // Existing record found — compare only the indexed columns.
+                let (prefix_len, key_columns, num_cols) = match &self.index_key_info {
+                    Some(info) => (
+                        info.num_cols - (info.has_rowid as usize),
+                        Some(&info.key_columns[..]),
+                        info.num_cols,
+                    ),
+                    None => {
+                        let prefix_len = if self.has_rowid() {
+                            record.count().saturating_sub(1)
+                        } else {
+                            record.count()
+                        };
+                        (prefix_len, None, prefix_len)
+                    }
+                };
 
-                Ok(CursorResult::Ok(
-                    existing_key
-                        .iter()
-                        .zip(inserted_key_vals.iter())
-                        .all(|(a, b)| a == b),
-                ))
+                let inserted_key_vals = &key.get_values();
+
+                if let Some(cols) = key_columns {
+                    let existing_vals = record.get_values();
+                    if inserted_key_vals.len() == num_cols {
+                        Ok(CursorResult::Ok(cols.iter().enumerate().all(|(i, col)| {
+                            existing_vals.get(*col) == inserted_key_vals.get(i)
+                        })))
+                    } else {
+                        Ok(CursorResult::Ok(cols.iter().all(|col| {
+                            existing_vals.get(*col) == inserted_key_vals.get(*col)
+                        })))
+                    }
+                } else {
+                    let existing_key = &record.get_values()[..prefix_len];
+                    if existing_key.len() != inserted_key_vals.len() {
+                        return Ok(CursorResult::Ok(false));
+                    }
+                    Ok(CursorResult::Ok(
+                        existing_key
+                            .iter()
+                            .zip(inserted_key_vals.iter())
+                            .all(|(a, b)| a == b),
+                    ))
+                }
             }
-            None => {
-                // Cursor not pointing at a record — table is empty or past last
-                Ok(CursorResult::Ok(false))
-            }
+            None => Ok(CursorResult::Ok(false)),
         }
     }
 

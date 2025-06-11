@@ -31,7 +31,8 @@ use crate::{
 use crate::{
     storage::wal::CheckpointResult,
     types::{
-        AggContext, Cursor, CursorResult, ExternalAggState, SeekKey, SeekOp, Value, ValueType,
+        AggContext, Cursor, CursorResult, ExternalAggState, IndexKeySortOrder, SeekKey, SeekOp,
+        Value, ValueType,
     },
     util::{
         cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
@@ -884,8 +885,42 @@ pub fn op_open_read(
     };
     let mut cursors = state.cursors.borrow_mut();
     match cursor_type {
-        CursorType::BTreeTable(_) => {
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page);
+        CursorType::BTreeTable(table) => {
+            let cursor = if table.has_rowid {
+                BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page)
+            } else {
+                let sort_order = IndexKeySortOrder::from_list(
+                    &table
+                        .primary_key_columns
+                        .iter()
+                        .map(|(_, o)| *o)
+                        .collect::<Vec<_>>(),
+                );
+                let collations = table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(name, _)| {
+                        table
+                            .get_column(name)
+                            .unwrap()
+                            .1
+                            .collation
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                BTreeCursor::new_table_without_rowid(
+                    mv_cursor,
+                    pager.clone(),
+                    *root_page,
+                    sort_order,
+                    collations,
+                    table
+                        .primary_key_columns
+                        .iter()
+                        .map(|(name, _)| table.get_column(name).unwrap().0)
+                        .collect(),
+                )
+            };
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
@@ -4040,8 +4075,10 @@ pub fn op_idx_insert(
     } = *insn
     {
         let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-        let CursorType::BTreeIndex(index_meta) = cursor_type else {
-            panic!("IdxInsert: not a BTree index cursor");
+        let unique = match cursor_type {
+            CursorType::BTreeIndex(index_meta) => index_meta.unique,
+            CursorType::BTreeTable(table_meta) if !table_meta.has_rowid => true,
+            _ => panic!("IdxInsert: not a BTree index cursor"),
         };
         {
             let mut cursor = state.get_cursor(cursor_id);
@@ -4060,7 +4097,7 @@ pub fn op_idx_insert(
             let moved_before = if cursor.is_write_in_progress() {
                 true
             } else {
-                if index_meta.unique {
+                if unique {
                     // check for uniqueness violation
                     match cursor.key_exists_in_index(record)? {
                         CursorResult::Ok(true) => {
@@ -4320,9 +4357,10 @@ pub fn op_open_write(
     };
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mut cursors = state.cursors.borrow_mut();
-    let maybe_index = match cursor_type {
-        CursorType::BTreeIndex(index) => Some(index),
-        _ => None,
+    let (maybe_index, maybe_table) = match cursor_type {
+        CursorType::BTreeIndex(index) => (Some(index), None),
+        CursorType::BTreeTable(table) => (None, Some(table)),
+        _ => (None, None),
     };
     let mv_cursor = match state.mv_tx_id {
         Some(tx_id) => {
@@ -4362,6 +4400,46 @@ pub fn op_open_write(
             index.as_ref(),
             collations,
         );
+        cursors
+            .get_mut(*cursor_id)
+            .unwrap()
+            .replace(Cursor::new_btree(cursor));
+    } else if let Some(table) = maybe_table {
+        let cursor = if table.has_rowid {
+            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize)
+        } else {
+            let sort_order = IndexKeySortOrder::from_list(
+                &table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(_, o)| *o)
+                    .collect::<Vec<_>>(),
+            );
+            let collations = table
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| {
+                    table
+                        .get_column(name)
+                        .unwrap()
+                        .1
+                        .collation
+                        .unwrap_or_default()
+                })
+                .collect();
+            BTreeCursor::new_table_without_rowid(
+                mv_cursor,
+                pager.clone(),
+                root_page as usize,
+                sort_order,
+                collations,
+                table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(name, _)| table.get_column(name).unwrap().0)
+                    .collect(),
+            )
+        };
         cursors
             .get_mut(*cursor_id)
             .unwrap()

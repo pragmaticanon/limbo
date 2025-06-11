@@ -385,14 +385,10 @@ fn check_automatic_pk_index_required(
                 }
             }
 
-            // Check if table has rowid
-            if options.contains(ast::TableOptions::WITHOUT_ROWID) {
-                bail_parse_error!("WITHOUT ROWID tables are not supported yet");
-            }
-
             unique_sets.dedup();
 
             // Check if we need an automatic index
+            let without_rowid = options.contains(ast::TableOptions::WITHOUT_ROWID);
             let mut pk_is_unique = false;
             let auto_index_pk = if let Some(primary_key_definition) = &primary_key_definition {
                 match primary_key_definition {
@@ -405,8 +401,12 @@ fn check_automatic_pk_index_required(
                             .iter()
                             .any(|set| set.len() == 1 && set.contains(column));
                         let is_integer =
-                            typename.is_some() && typename.unwrap().eq_ignore_ascii_case("INTEGER"); // Should match on any case of INTEGER
-                        !is_integer || *is_descending
+                            typename.is_some() && typename.unwrap().eq_ignore_ascii_case("INTEGER");
+                        if without_rowid {
+                            true
+                        } else {
+                            !is_integer || *is_descending
+                        }
                     }
                     PrimaryKeyDefinitionType::Composite { columns } => {
                         pk_is_unique = unique_sets.iter().any(|set| set == columns);
